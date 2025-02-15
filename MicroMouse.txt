@@ -1,0 +1,319 @@
+#include <Wire.h>
+#include <MPU6050.h>
+#include <VL53L0X.h>
+
+// Motor 1 pins
+#define IN1 12
+#define IN2 13
+#define ENA 25
+
+// Motor 2 pins
+#define IN3 14
+#define IN4 15
+#define ENB 26
+
+// Encoder pins
+#define ENCODER1_A 16
+#define ENCODER1_B 19
+#define ENCODER2_A 18
+#define ENCODER2_B 17
+
+// Sensor XSHUT Pins
+#define FRONT_XSHUT 32
+#define LEFT_XSHUT 23
+#define RIGHT_XSHUT 33
+
+// Encoder variables
+volatile long encoder1Count = 0;
+volatile long encoder2Count = 0;
+
+// Motor parameters
+const int CPR_MOTOR_A = 203;
+const int CPR_MOTOR_B = 201;
+const float WHEEL_DIAMETER = 2.85; // cm
+const float WHEEL_CIRCUMFERENCE = WHEEL_DIAMETER * 3.14159; // cm
+const float DISTANCE_TO_TRAVEL = 20; // cm
+
+// Target encoder counts for 20 cm travel
+const int TARGET_COUNT_A = (DISTANCE_TO_TRAVEL / WHEEL_CIRCUMFERENCE) * CPR_MOTOR_A;
+const int TARGET_COUNT_B = (DISTANCE_TO_TRAVEL / WHEEL_CIRCUMFERENCE) * CPR_MOTOR_B;
+
+// MPU6050 object
+MPU6050 mpu;
+
+// PID constants
+float Kp = 0.6, Ki = 0.02, Kd = 0.05;
+float setpoint = 0.0, heading = 0.0;
+float previousError = 0.0, integral = 0.0;
+
+// Motor control
+int baseSpeed = 40, maxCorrection = 30;
+int motor1Speed, motor2Speed;
+
+// Movement states
+enum State { MOVING, STOPPED };
+State currentState = MOVING;
+unsigned long stopStartTime = 0;
+unsigned long stopDuration = 3000; // 3 seconds for stopping
+
+// Sensor variables
+float filteredGyroZ = 0;
+float alpha = 0.8;
+unsigned long previousTime = 0;
+
+// ToF Sensors
+VL53L0X frontSensor;
+VL53L0X leftSensor;
+VL53L0X rightSensor;
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  
+  // Initialize MPU6050
+  mpu.initialize();
+  if(!mpu.testConnection()) {
+    Serial.println("MPU6050 initialization failed!");
+    while(1);
+  }
+
+  // Motor control pins
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT); pinMode(ENA, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT); pinMode(ENB, OUTPUT);
+  
+  // Encoder interrupts
+  pinMode(ENCODER1_A, INPUT); pinMode(ENCODER1_B, INPUT);
+  pinMode(ENCODER2_A, INPUT); pinMode(ENCODER2_B, INPUT);
+  attachInterrupt(digitalPinToInterrupt(ENCODER1_A), encoder1ISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER2_A), encoder2ISR, CHANGE);
+
+  // Initialize sensors
+  initializeSensors();
+  mpu.CalibrateGyro(6);
+  
+  // Reset encoders
+  noInterrupts();
+  encoder1Count = encoder2Count = 0;
+  interrupts();
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+  float dt = (currentTime - previousTime) / 1000.0;
+  previousTime = currentTime;
+
+  // State machine control
+  switch(currentState) {
+    case MOVING:
+      handleMovement(dt);
+      checkDistance();
+      break;
+      
+    case STOPPED:
+      if (currentTime - stopStartTime >= stopDuration) {
+        checkObstacles();
+      }
+      break;
+  }
+}
+
+void handleMovement(float dt) {
+  // Update orientation using gyro
+  float rawGyroZ = mpu.getRotationZ();
+  filteredGyroZ = alpha * filteredGyroZ + (1 - alpha) * rawGyroZ;
+  heading += filteredGyroZ * dt;
+
+  // Read encoder values
+  noInterrupts();
+  long count1 = encoder1Count;
+  long count2 = encoder2Count;
+  interrupts();
+
+  // Calculate encoder error
+  float encoderError = (count1 - count2) * 0.1;
+  float error = setpoint - heading + encoderError;
+
+  // PID Correction
+  integral += error * dt;
+  float derivative = (error - previousError) / dt;
+  float output = Kp * error + Ki * integral + Kd * derivative;
+  output = constrain(output, -maxCorrection, maxCorrection);
+  previousError = error;
+
+  // Adjust motor speeds dynamically
+  motor1Speed = constrain(baseSpeed + output, 30, 255);
+  motor2Speed = constrain(baseSpeed - output, 30, 255);
+
+  // Apply motor speeds
+  analogWrite(ENA, motor1Speed);
+  analogWrite(ENB, motor2Speed);
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void checkDistance() {
+  noInterrupts();
+  long count1 = encoder1Count;
+  long count2 = encoder2Count;
+  interrupts();
+  
+  if(count1 >= TARGET_COUNT_A && count2 >= TARGET_COUNT_B) {
+    stopMotors();
+    currentState = STOPPED;
+    stopStartTime = millis();
+    Serial.println("Reached 20cm - Scanning Environment");
+  }
+}
+
+void checkObstacles() {
+  int frontDist = frontSensor.readRangeContinuousMillimeters();
+  int leftDist = leftSensor.readRangeContinuousMillimeters();
+  int rightDist = rightSensor.readRangeContinuousMillimeters();
+
+  Serial.print("Front: "); Serial.print(frontDist);
+  Serial.print("mm | Left: "); Serial.print(leftDist);
+  Serial.print("mm | Right: "); Serial.println(rightDist);
+
+  if (rightDist > 100 && !rightSensor.timeoutOccurred()) {
+    turnDegrees(90);
+  } else if (frontDist > 100 && !frontSensor.timeoutOccurred()) {
+    // Continue moving forward
+  } else if (leftDist > 100 && !leftSensor.timeoutOccurred()) {
+    turnDegrees(-90);
+  } else {
+    turnDegrees(90);
+    turnDegrees(90);
+  }
+
+  resumeMovement();
+}
+
+void resumeMovement() {
+  noInterrupts();
+  encoder1Count = encoder2Count = 0;
+  interrupts();
+  integral = 0;
+  previousError = 0;
+  heading = 0;
+  currentState = MOVING;
+  Serial.println("Resuming Movement");
+}
+
+void initializeSensors() {
+  pinMode(FRONT_XSHUT, OUTPUT);
+  pinMode(LEFT_XSHUT, OUTPUT);
+  pinMode(RIGHT_XSHUT, OUTPUT);
+  digitalWrite(FRONT_XSHUT, LOW);
+  digitalWrite(LEFT_XSHUT, LOW);
+  digitalWrite(RIGHT_XSHUT, LOW);
+  delay(10);
+
+  digitalWrite(FRONT_XSHUT, HIGH);
+  frontSensor.init();
+  frontSensor.setAddress(0x30);
+  frontSensor.startContinuous();
+  delay(10);
+
+  digitalWrite(LEFT_XSHUT, HIGH);
+  leftSensor.init();
+  leftSensor.setAddress(0x31);
+  leftSensor.startContinuous();
+  delay(10);
+
+  digitalWrite(RIGHT_XSHUT, HIGH);
+  rightSensor.init();
+  rightSensor.setAddress(0x32);
+  rightSensor.startContinuous();
+}
+
+void stopMotors() {
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+// Encoder ISRs
+void encoder1ISR() { encoder1Count++; }
+void encoder2ISR() { encoder2Count++; }
+
+void turnDegrees(float targetDegrees) {
+  float targetHeading = heading + targetDegrees;
+  targetHeading = fmod(targetHeading, 360);
+  if (targetHeading < -180) targetHeading += 360;
+  else if (targetHeading > 180) targetHeading -= 360;
+
+  float integral = 0;
+  float previousError = 0;
+  unsigned long lastTime = millis();
+  const float threshold = 1.6;  // Smaller threshold for better accuracy
+  const int timeout = 1200;      // Allow enough time for correction
+  unsigned long startTime = millis();
+
+  int speedLimit = 80;  
+  const int maxSpeed = 100;  
+  const int minSpeed = 40;  // Prevents sudden stops
+
+  while (fabs(targetHeading - heading) > threshold && (millis() - startTime) < timeout) {
+    unsigned long now = millis();
+    float deltaTime = (now - lastTime) / 1000.0f;
+    lastTime = now;
+
+    float error = targetHeading - heading;
+    if (error > 180) error -= 360;
+    else if (error < -180) error += 360;
+
+    // Slower PID Correction
+    float proportional = (Kp * 0.5) * error;  // Reduce Kp to smooth movement
+    integral += (Ki * 0.5) * error * deltaTime;
+    integral = constrain(integral, -maxCorrection, maxCorrection);
+    float derivative = (Kd * 0.3) * (error - previousError) / deltaTime;  // Reduce Kd for less oscillation
+    previousError = error;
+
+    int output = (proportional + integral + derivative)*5;
+    output = constrain(output, -speedLimit, speedLimit);
+
+    // Easing Function for Smoother Deceleration
+    float easingFactor = pow((fabs(error) / 90.0), 3);  // Cubic easing
+    speedLimit = maxSpeed * easingFactor;
+    speedLimit = constrain(speedLimit, minSpeed, maxSpeed);
+
+    // Ensure a minimum speed is applied
+    if (abs(output) < minSpeed) output = (output > 0) ? minSpeed : -minSpeed;
+
+    int motor1Speed = -output;
+    int motor2Speed = output;
+
+    analogWrite(ENA, abs(motor1Speed));
+    analogWrite(ENB, abs(motor2Speed));
+    digitalWrite(IN1, motor1Speed > 0 ? HIGH : LOW);
+    digitalWrite(IN2, motor1Speed > 0 ? LOW : HIGH);
+    digitalWrite(IN3, motor2Speed > 0 ? HIGH : LOW);
+    digitalWrite(IN4, motor2Speed > 0 ? LOW : HIGH);
+
+    int16_t gx, gy, gz;
+    mpu.getRotation(&gx, &gy, &gz);
+    float gyroZ = gz / 131.0;
+
+    filteredGyroZ = alpha * filteredGyroZ + (1 - alpha) * gyroZ;
+    heading += filteredGyroZ * deltaTime;
+
+    heading = fmod(heading, 360);
+    if (heading < -180) heading += 360;
+    else if (heading > 180) heading -= 360;
+
+    delay(5);  // Shorter delay for finer control
+  }
+
+  // Controlled Stop to Avoid Jitter
+  analogWrite(ENA, 20);
+  analogWrite(ENB, 20);
+  delay(50);
+
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+}
